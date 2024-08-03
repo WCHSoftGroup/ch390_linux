@@ -32,7 +32,7 @@ Integrated into your system method2
 ---------------------------------------
 1. Please copy the driver file to the kernel directory:$kernel_src/drivers/net/ethernet
 
-2. Please add the followed txt into the kernel file:$kernel_src/drivers/net/ethernet/Konfig
+2. Please add the followed txt into the kernel file:$kernel_src/drivers/net/ethernet/Kconfig
 config ETHERNET_CH390
 	tristate "ETHERNET_CH390 ethernet support"
 	depends on SPI
@@ -40,7 +40,7 @@ config ETHERNET_CH390
 	help
 	  This selects support for ch390 ethernet.
 	
-3. Add the follow define into the $kernel_src\drivers\net\ethernet\Makefile for compile the driver.
+3. Add the follow define into the $kernel_src/drivers/net/ethernet/Makefile for compile the driver.
 obj-$(CONFIG_SERIAL_CH390) += ch390.o
 
 4. Run the make menuconfig and select the ch390 ethernet support at the driver/net/ethernet and save the config.
