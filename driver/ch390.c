@@ -27,7 +27,6 @@
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/phy.h>
-#include <linux/regmap.h>
 #include <linux/skbuff.h>
 #include <linux/spinlock.h>
 #include <linux/spi/spi.h>
@@ -40,7 +39,7 @@
 #define DRVNAME_CH390 "ch390"
 #define DRIVER_AUTHOR "WCH"
 #define DRIVER_DESC   "SPI ethernet driver for ch390, etc."
-#define VERSION_DESC  "V1.1 On 2024.08"
+#define VERSION_DESC  "V1.1 On 2024.09"
 
 /*
  * struct rx_ctl_mach - rx activities record
@@ -92,8 +91,8 @@ struct ch390_rxhdr {
 };
 
 enum val_type {
-    TYPE_U8,
-    TYPE_U16
+	TYPE_U8,
+	TYPE_U16
 };
 
 /*
@@ -103,20 +102,20 @@ enum val_type {
  * @mdiobus: mii bus structure
  * @phydev: phy device structure
  * @txq: tx queue structure
- * @regmap_dm: regmap for register read/write
- * @regmap_dmbulk: extra regmap for bulk read/write
  * @rxctrl_work: Work queue for updating RX mode and multicast lists
  * @tx_work: Work queue for tx packets
  * @pause: ethtool pause parameter structure
  * @spi_lockm: between threads lock structure
- * @reg_mutex: regmap access lock structure
+ * @reg_mutex: reg write/read lock structure
  * @bc: rx control statistics structure
  * @rxhdr: rx header structure
  * @rctl: rx control setting structure
  * @msg_enable: message level value
  * @imr_all: to store operating imr value for register ch390_IMR
  * @lcr_all: to store operating rcr value for register ch390_LMCR
- *
+ * @reg_stride: The register address stride. Valid register addresses are a
+ * 				multiple of this value. If set to 0, a value of 1 will be
+ *              used.
  * The saved data variables, keep up to date for retrieval back to use
  */
 struct board_info {
@@ -126,8 +125,6 @@ struct board_info {
 	struct mii_bus *mdiobus;
 	struct phy_device *phydev;
 	struct sk_buff_head txq;
-	struct regmap *regmap_dm;
-	struct regmap *regmap_dmbulk;
 	struct work_struct rxctrl_work;
 	struct work_struct tx_work;
 	struct ethtool_pauseparam pause;
@@ -138,6 +135,7 @@ struct board_info {
 	struct ch390_rxctrl rctl;
 	u8 imr_all;
 	u8 lcr_all;
+	int reg_stride;
 };
 
 static int ch390_set_reg(struct board_info *db, unsigned int reg, unsigned int val)
@@ -169,24 +167,28 @@ static int ch390_get_reg(struct board_info *db, unsigned int reg, void *val)
 
 static int ch390_update_bits(struct board_info *db, unsigned int reg, unsigned int mask, unsigned int val)
 {
-    int ret;
-    u8 current_val;
+	int ret;
+	u8 current_val;
 
-    ret = ch390_get_reg(db, reg, &current_val);
-    if (ret < 0) {
-        netif_err(db, drv, db->ndev, "%s: error %d reading reg %02x\n", __func__, ret, reg);
-        return ret;
-    }
+	mutex_lock(&db->reg_mutex);
 
-    current_val = (current_val & ~mask) | (val & mask);
+	ret = ch390_get_reg(db, reg, &current_val);
+	if (ret < 0) {
+		netif_err(db, drv, db->ndev, "%s: error %d reading reg %02x\n", __func__, ret, reg);
+		mutex_unlock(&db->reg_mutex);
+		return ret;
+	}
 
-    ret = ch390_set_reg(db, reg, current_val);
-    if (ret < 0) {
-        netif_err(db, drv, db->ndev, "%s: error %d writing reg %02x\n", __func__, ret, reg);
-        return ret;
-    }
+	current_val = (current_val & ~mask) | (val & mask);
 
-    return 0;
+	ret = ch390_set_reg(db, reg, current_val);
+	if (ret < 0) {
+		netif_err(db, drv, db->ndev, "%s: error %d writing reg %02x\n", __func__, ret, reg);
+	}
+
+	mutex_unlock(&db->reg_mutex);
+
+	return ret;
 }
 
 /*
@@ -196,8 +198,8 @@ static int ch390_dumpblk(struct board_info *db, u8 reg, size_t count)
 {
 	struct net_device *ndev = db->ndev;
 	u8 cmd_buf[2];
-    u8 rb;
-    int ret;
+	u8 rb;
+	int ret;
 
 	cmd_buf[0] = OPC_MEM_READ;
 	cmd_buf[1] = 0x00;
@@ -210,128 +212,208 @@ static int ch390_dumpblk(struct board_info *db, u8 reg, size_t count)
 		}
 	} while (--count);
 
-    return ret;
+	return ret;
 }
 
-static int ch390_set_regs(struct board_info *db, unsigned int reg, const void *val, size_t val_count, enum val_type type)
+static int ch390_set_regs(struct board_info *db, unsigned int reg, const void *val, size_t val_count,
+			  enum val_type type)
 {
-    int ret;
-	size_t i;
+	int ret = 0;
+	int i;
 
-    if (type == TYPE_U16) {
-        const u16 *val_words = (const u16 *)val;
-        for (i = 0; i < val_count / 2; i++) {
-            ret = ch390_set_reg(db, reg + i * 2, val_words[i] & 0xFF);
-            if (ret < 0)
-                netif_err(db, drv, db->ndev, "%s: error %d writing reg %02lx\n", __func__, ret, reg + i * 2);
+	if (!IS_ALIGNED(reg, db->reg_stride))
+		return -EINVAL;
+
+	mutex_lock(&db->reg_mutex);
+
+	if (type == TYPE_U16) {
+		const u16 *val_words = (const u16 *)val;
+		for (i = 0; i < val_count / 2; i++) {
+			ret = ch390_set_reg(db, reg + i * 2, val_words[i] & 0xFF);
+			if (ret < 0) {
+				netif_err(db, drv, db->ndev, "%s: error %d writing reg %02x\n", __func__, ret,
+					  reg + i * 2);
+				break;
+			}
 
 			ret = ch390_set_reg(db, reg + i * 2 + 1, (val_words[i] >> 8) & 0xFF);
-            if (ret < 0)
-                netif_err(db, drv, db->ndev, "%s: error %d writing reg %02lx\n", __func__, ret, reg + i * 2 + 1);
-        }
-    } else {
-        const u8 *val_bytes = (const u8 *)val;
+			if (ret < 0) {
+				netif_err(db, drv, db->ndev, "%s: error %d writing reg %02x\n", __func__, ret,
+					  reg + i * 2 + 1);
+				break;
+			}
+		}
+	} else {
+		const u8 *val_bytes = (const u8 *)val;
 		for (i = 0; i < val_count; i++) {
-            ret = ch390_set_reg(db, reg + i, val_bytes[i]);
-            if (ret < 0)
-                netif_err(db, drv, db->ndev, "%s: error %d writing reg %02lx\n", __func__, ret, reg + i);
-        }
-    }
-
-    return ret;
-}
-
-static int ch390_get_regs(struct board_info *db, unsigned int reg, u8 *val, size_t val_count)
-{
-	int i, ret;
-	u8 temp;
-
-	for( i = 0; i < val_count; i++) {
-		ret = ch390_get_reg(db, reg + i, &temp);
-		if (ret)
-			netif_err(db, drv, db->ndev, "%s: error %d noinc reading regs %02x\n", __func__, ret, reg + i);
-		val[i] = temp;
+			ret = ch390_set_reg(db, reg + i, val_bytes[i]);
+			if (ret < 0) {
+				netif_err(db, drv, db->ndev, "%s: error %d writing reg %02x\n", __func__, ret, reg + i);
+				break;
+			}
+		}
 	}
+
+	mutex_unlock(&db->reg_mutex);
 
 	return ret;
 }
 
+static int ch390_get_regs(struct board_info *db, unsigned int reg, void *val, size_t val_count, enum val_type type)
+{
+	int ret = 0;
+	int i;
+
+	if (!IS_ALIGNED(reg, db->reg_stride))
+		return -EINVAL;
+
+	mutex_lock(&db->reg_mutex);
+
+	if (type == TYPE_U16) {
+		u16 *val_words = (u16 *)val;
+		for (i = 0; i < val_count / 2; i++) {
+			u8 low, high;
+
+			ret = ch390_get_reg(db, reg + i * 2, &low);
+			if (ret < 0) {
+				netif_err(db, drv, db->ndev, "%s: error %d reading reg %02x\n", __func__, ret,
+					  reg + i * 2);
+				break;
+			}
+
+			ret = ch390_get_reg(db, reg + i * 2 + 1, &high);
+			if (ret < 0) {
+				netif_err(db, drv, db->ndev, "%s: error %d reading reg %02x\n", __func__, ret,
+					  reg + i * 2 + 1);
+				break;
+			}
+
+			val_words[i] = (high << 8) | low;
+		}
+	} else {
+		u8 *val_bytes = (u8 *)val;
+		for (i = 0; i < val_count; i++) {
+			ret = ch390_get_reg(db, reg + i, &val_bytes[i]);
+			if (ret < 0) {
+				netif_err(db, drv, db->ndev, "%s: error %d reading reg %02x\n", __func__, ret, reg + i);
+				break;
+			}
+		}
+	}
+
+	mutex_unlock(&db->reg_mutex);
+
+	return ret;
+}
+
+/*
+ * Note: The declaration of 'struct spi_transfer xfer' is intentionally placed after
+ * the initialization of 'tx_buf' to avoid compiler warnings.  This is a workaround
+ * for systems that experience issues with bufferless transfers of length 1.
+ */
+
 static int ch390_write_mem(struct board_info *db, unsigned int reg, const void *buff, size_t len)
 {
-    int ret;
-    struct spi_message msg;
-    u8 *tx_buf;
+	int ret;
+	struct spi_message msg;
+	u8 *tx_buf;
 
-    tx_buf = kzalloc(len + 1, GFP_KERNEL);
-    if (!tx_buf)
-        return -ENOMEM;
+	tx_buf = kzalloc(len + 1, GFP_KERNEL);
+	if (!tx_buf)
+		return -ENOMEM;
 
-    tx_buf[0] = reg;
+	tx_buf[0] = reg;
 
-    memcpy(tx_buf + 1, buff, len);
+	memcpy(tx_buf + 1, buff, len);
 
 	struct spi_transfer xfer = {
 		.tx_buf = tx_buf,
 		.rx_buf = NULL,
-    	.len = len + 1,
+		.len = len + 1,
 	};
-	
-    spi_message_init(&msg);
-    spi_message_add_tail(&xfer, &msg);
 
-    ret = spi_sync(db->spidev, &msg);
+	spi_message_init(&msg);
+	spi_message_add_tail(&xfer, &msg);
+
+	ret = spi_sync(db->spidev, &msg);
 	if (ret < 0)
-        netif_err(db, drv, db->ndev, "%s: error %d writing regs %02x\n", __func__, ret, reg);
+		netif_err(db, drv, db->ndev, "%s: error %d writing regs %02x\n", __func__, ret, reg);
 
-    kfree(tx_buf);
+	kfree(tx_buf);
 
-    return ret;
+	return ret;
 }
 
 static int ch390_read_mem(struct board_info *db, unsigned int reg, void *buff, size_t len)
 {
-    int ret;
-    struct spi_message msg;
-    u8 cmd_buf = reg;
-
-    spi_message_init(&msg);
+	int ret;
+	struct spi_message msg;
+	u8 cmd_buf = reg;
 
 	struct spi_transfer xfer1 = {
 		.tx_buf = &cmd_buf,
 		.rx_buf = NULL,
 		.len = sizeof(cmd_buf),
 	};
-	spi_message_add_tail(&xfer1, &msg);
-	
 	struct spi_transfer xfer2 = {
 		.tx_buf = NULL,
 		.rx_buf = buff,
 		.len = len,
 	};
-    spi_message_add_tail(&xfer2, &msg);
+	spi_message_init(&msg);
 
-    ret = spi_sync(db->spidev, &msg);
-    if (ret < 0)
-        netif_err(db, drv, db->ndev, "%s: error %d reading regs %02x\n", __func__, ret, reg);
+	spi_message_add_tail(&xfer1, &msg);
+	spi_message_add_tail(&xfer2, &msg);
 
-    return ret;
+	ret = spi_sync(db->spidev, &msg);
+	if (ret < 0)
+		netif_err(db, drv, db->ndev, "%s: error %d reading regs %02x\n", __func__, ret, reg);
+
+	return ret;
+}
+
+static int ch390_wait_for_condition(struct board_info *db, unsigned int reg, u8 mask, unsigned int timeout_us,
+				    unsigned int delay_us)
+{
+	unsigned int elapsed_us = 0;
+	u8 mval;
+	int ret;
+
+	while (elapsed_us < timeout_us) {
+		ret = ch390_get_reg(db, reg, &mval);
+		if (ret < 0)
+			return ret;
+
+		if (!(mval & mask))
+			return 0;
+
+		usleep_range(delay_us / 2, delay_us);
+		elapsed_us += delay_us;
+	}
+
+	return -ETIMEDOUT;
 }
 
 static int ch390_epcr_poll(struct board_info *db)
 {
-	unsigned int mval;
 	int ret;
 
-	ret = regmap_read_poll_timeout(db->regmap_dm, CH390_EPCR, mval, !(mval & EPCR_ERRE), 100, 10000);
+	ret = ch390_wait_for_condition(db, CH390_EPCR, EPCR_ERRE, 10000, 100);
 	if (ret == -ETIMEDOUT)
 		netdev_err(db->ndev, "eeprom/phy in processing get timeout\n");
+
 	return ret;
 }
 
 static int ch390_irq_flag(struct board_info *db)
 {
 	struct spi_device *spi = db->spidev;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0))
 	int irq_type = irq_get_trigger_type(spi->irq);
+#else
+	struct irq_data *d = irq_get_irq_data(spi->irq);
+	int irq_type = d ? irqd_get_trigger_type(d) : 0;
+#endif
 
 	if (irq_type)
 		return irq_type;
@@ -373,11 +455,11 @@ static int ch390_core_reset(struct board_info *db)
 
 	db->bc.fifo_rst_counter++;
 
-	ret = regmap_write(db->regmap_dm, CH390_NCR, NCR_RST); /* NCR reset */
+	ret = ch390_set_reg(db, CH390_NCR, NCR_RST); /* NCR reset */
 	if (ret)
 		return ret;
 
-	ret = regmap_write(db->regmap_dm, CH390_MLEDCR, db->lcr_all); /* LEDMode1 */
+	ret = ch390_set_reg(db, CH390_MLEDCR, db->lcr_all); /* LEDMode1 */
 	if (ret)
 		return ret;
 
@@ -403,7 +485,7 @@ static int ch390_disable_interrupt(struct board_info *db)
 
 static int ch390_enable_interrupt(struct board_info *db)
 {
-	return ch390_set_reg(db, CH390_IMR, db->imr_all);
+	return ch390_set_reg(db, CH390_IMR, IMR_ALL);
 }
 
 static int ch390_clear_interrupt(struct board_info *db)
@@ -415,11 +497,11 @@ static int ch390_eeprom_read(struct board_info *db, int offset, u8 *to)
 {
 	int ret;
 
-	ret = regmap_write(db->regmap_dm, CH390_EPAR, offset);
+	ret = ch390_set_reg(db, CH390_EPAR, offset);
 	if (ret)
 		return ret;
 
-	ret = regmap_write(db->regmap_dm, CH390_EPCR, EPCR_ERPRR);
+	ret = ch390_set_reg(db, CH390_EPCR, EPCR_ERPRR);
 	if (ret)
 		return ret;
 
@@ -427,25 +509,25 @@ static int ch390_eeprom_read(struct board_info *db, int offset, u8 *to)
 	if (ret)
 		return ret;
 
-	ret = regmap_write(db->regmap_dm, CH390_EPCR, 0);
+	ret = ch390_set_reg(db, CH390_EPCR, 0);
 	if (ret)
 		return ret;
-	return regmap_bulk_read(db->regmap_dmbulk, CH390_EPDRL, to, 2);
+	return ch390_get_regs(db, CH390_EPDRL, to, 2, TYPE_U8);
 }
 
 static int ch390_eeprom_write(struct board_info *db, int offset, u8 *data)
 {
 	int ret;
 
-	ret = regmap_write(db->regmap_dm, CH390_EPAR, offset);
+	ret = ch390_set_reg(db, CH390_EPAR, offset);
 	if (ret)
 		return ret;
 
-	ret = regmap_bulk_write(db->regmap_dmbulk, CH390_EPDRL, data, 2);
+	ret = ch390_set_regs(db, CH390_EPDRL, data, 2, TYPE_U8);
 	if (ret < 0)
 		return ret;
 
-	ret = regmap_write(db->regmap_dm, CH390_EPCR, EPCR_WEP | EPCR_ERPRW);
+	ret = ch390_set_reg(db, CH390_EPCR, EPCR_WEP | EPCR_ERPRW);
 	if (ret)
 		return ret;
 
@@ -453,7 +535,7 @@ static int ch390_eeprom_write(struct board_info *db, int offset, u8 *data)
 	if (ret)
 		return ret;
 
-	return regmap_write(db->regmap_dm, CH390_EPCR, 0);
+	return ch390_set_reg(db, CH390_EPCR, 0);
 }
 
 static int ch390_phyread(void *context, unsigned int reg, unsigned int *val)
@@ -461,11 +543,11 @@ static int ch390_phyread(void *context, unsigned int reg, unsigned int *val)
 	struct board_info *db = context;
 	int ret;
 
-	ret = regmap_write(db->regmap_dm, CH390_EPAR, CH390_PHY | reg);
+	ret = ch390_set_reg(db, CH390_EPAR, CH390_PHY | reg);
 	if (ret)
 		return ret;
 
-	ret = regmap_write(db->regmap_dm, CH390_EPCR, EPCR_ERPRR | EPCR_EPOS);
+	ret = ch390_set_reg(db, CH390_EPCR, EPCR_ERPRR | EPCR_EPOS);
 	if (ret)
 		return ret;
 
@@ -473,28 +555,28 @@ static int ch390_phyread(void *context, unsigned int reg, unsigned int *val)
 	if (ret)
 		return ret;
 
-	ret = regmap_write(db->regmap_dm, CH390_EPCR, 0);
+	ret = ch390_set_reg(db, CH390_EPCR, 0);
 	if (ret)
 		return ret;
 
 	*val = 0;
-	return regmap_bulk_read(db->regmap_dmbulk, CH390_EPDRL, val, 2);
+	return ch390_get_regs(db, CH390_EPDRL, val, 2, TYPE_U16);
 }
 
-static int ch390_phywrite(void *context, unsigned int reg, unsigned int val)
+static int ch390_phywrite(void *context, unsigned int reg, u16 val)
 {
 	struct board_info *db = context;
 	int ret;
 
-	ret = regmap_write(db->regmap_dm, CH390_EPAR, CH390_PHY | reg);
+	ret = ch390_set_reg(db, CH390_EPAR, CH390_PHY | reg);
 	if (ret)
 		return ret;
 
-	ret = regmap_bulk_write(db->regmap_dmbulk, CH390_EPDRL, &val, 2);
+	ret = ch390_set_regs(db, CH390_EPDRL, &val, 2, TYPE_U16);
 	if (ret < 0)
 		return ret;
 
-	ret = regmap_write(db->regmap_dm, CH390_EPCR, EPCR_EPOS | EPCR_ERPRW);
+	ret = ch390_set_reg(db, CH390_EPCR, EPCR_EPOS | EPCR_ERPRW);
 	if (ret)
 		return ret;
 
@@ -502,7 +584,7 @@ static int ch390_phywrite(void *context, unsigned int reg, unsigned int val)
 	if (ret)
 		return ret;
 
-	return regmap_write(db->regmap_dm, CH390_EPCR, 0);
+	return ch390_set_reg(db, CH390_EPCR, 0);
 }
 
 static int ch390_mdio_read(struct mii_bus *bus, int addr, int regnum)
@@ -530,67 +612,6 @@ static int ch390_mdio_write(struct mii_bus *bus, int addr, int regnum, u16 val)
 	return -ENODEV;
 }
 
-static void ch390_reg_lock_mutex(void *dbcontext)
-{
-	struct board_info *db = dbcontext;
-
-	mutex_lock(&db->reg_mutex);
-}
-
-static void ch390_reg_unlock_mutex(void *dbcontext)
-{
-	struct board_info *db = dbcontext;
-
-	mutex_unlock(&db->reg_mutex);
-}
-
-static struct regmap_config regconfigdm = {
-	.reg_bits = 8,
-	.val_bits = 8,
-	.max_register = 0xff,
-	.reg_stride = 1,
-	.cache_type = REGCACHE_NONE,
-	.read_flag_mask = OPC_REG_R,
-	.write_flag_mask = OPC_REG_W,
-	.val_format_endian = REGMAP_ENDIAN_LITTLE,
-	.lock = ch390_reg_lock_mutex,
-	.unlock = ch390_reg_unlock_mutex,
-};
-
-static struct regmap_config regconfigdmbulk = {
-	.reg_bits = 8,
-	.val_bits = 8,
-	.max_register = 0xff,
-	.reg_stride = 1,
-	.cache_type = REGCACHE_NONE,
-	.read_flag_mask = OPC_REG_R,
-	.write_flag_mask = OPC_REG_W,
-	.val_format_endian = REGMAP_ENDIAN_LITTLE,
-	.lock = ch390_reg_lock_mutex,
-	.unlock = ch390_reg_unlock_mutex,
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0))
-	.use_single_read = true,
-	.use_single_write = true,
-#else
-	.use_single_rw = true,
-#endif
-};
-
-static int ch390_map_init(struct spi_device *spi, struct board_info *db)
-{
-	regconfigdm.lock_arg = db;
-	db->regmap_dm = devm_regmap_init_spi(db->spidev, &regconfigdm);
-	if (IS_ERR(db->regmap_dm))
-		return PTR_ERR(db->regmap_dm);
-
-	regconfigdmbulk.lock_arg = db;
-	db->regmap_dmbulk = devm_regmap_init_spi(db->spidev, &regconfigdmbulk);
-	if (IS_ERR(db->regmap_dmbulk))
-		return PTR_ERR(db->regmap_dmbulk);
-
-	return 0;
-}
-
 static int ch390_map_chipid(struct board_info *db)
 {
 	struct device *dev = &db->spidev->dev;
@@ -598,7 +619,7 @@ static int ch390_map_chipid(struct board_info *db)
 	u8 buff[6];
 	int ret;
 
-	ret = ch390_get_regs(db, CH390_VIDL, buff, sizeof(buff) / sizeof(u8));
+	ret = ch390_get_regs(db, CH390_VIDL, buff, sizeof(buff), TYPE_U8);
 	if (ret < 0)
 		return ret;
 
@@ -620,12 +641,16 @@ static int ch390_map_etherdev_par(struct net_device *ndev, struct board_info *db
 	u8 addr[ETH_ALEN];
 	int ret;
 
-	ret = ch390_get_regs(db, CH390_PAR, addr, sizeof(addr) / sizeof(u8));
+	ret = ch390_get_regs(db, CH390_PAR, addr, sizeof(addr), TYPE_U8);
 	if (ret < 0)
 		return ret;
 
 	if (!is_valid_ether_addr(addr)) {
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 4, 0))
 		eth_hw_addr_random(ndev);
+#else
+		random_ether_addr(ndev->dev_addr);
+#endif
 
 		ret = ch390_set_regs(db, CH390_PAR, ndev->dev_addr, sizeof(ndev->dev_addr), TYPE_U8);
 		if (ret < 0)
@@ -647,10 +672,28 @@ static int ch390_map_etherdev_par(struct net_device *ndev, struct board_info *db
 /*
  * ethtool-ops
  */
-static void ch390_get_drvinfo(struct net_device *dev, struct ethtool_drvinfo *info)
+static void ch390_get_drvinfo(struct net_device *ndev, struct ethtool_drvinfo *info)
 {
-	strscpy(info->driver, DRVNAME_CH390, sizeof(info->driver));
+	strlcpy(info->driver, DRVNAME_CH390, sizeof(info->driver));
 }
+
+#if (LINUX_VERSION_CODE <= KERNEL_VERSION(4, 5, 0))
+static int ch390_get_settings(struct net_device *ndev, struct ethtool_cmd *cmd)
+{
+	if (!ndev->phydev)
+		return -ENODEV;
+
+	return phy_ethtool_gset(ndev->phydev, cmd);
+}
+
+static int ch390_set_settings(struct net_device *ndev, struct ethtool_cmd *cmd)
+{
+	if (!ndev->phydev)
+		return -ENODEV;
+
+	return phy_ethtool_sset(ndev->phydev, cmd);
+}
+#endif
 
 static void ch390_set_msglevel(struct net_device *ndev, u32 value)
 {
@@ -666,7 +709,18 @@ static u32 ch390_get_msglevel(struct net_device *ndev)
 	return db->msg_enable;
 }
 
-static int ch390_get_eeprom_len(struct net_device *dev)
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0))
+#else
+static int ch390_nway_reset(struct net_device *ndev)
+{
+	if (!ndev->phydev)
+		return -ENODEV;
+
+	return phy_start_aneg(ndev->phydev);
+}
+#endif
+
+static int ch390_get_eeprom_len(struct net_device *ndev)
 {
 	return 128;
 }
@@ -722,7 +776,7 @@ static void ch390_get_pauseparam(struct net_device *ndev, struct ethtool_pausepa
 static int ch390_set_pauseparam(struct net_device *ndev, struct ethtool_pauseparam *pause)
 {
 	struct board_info *db = to_ch390_board(ndev);
-	int advertise;
+	int advertise = 0;
 
 	db->pause = *pause;
 
@@ -751,11 +805,20 @@ static int ch390_set_pauseparam(struct net_device *ndev, struct ethtool_pausepar
 
 static const struct ethtool_ops ch390_ethtool_ops = {
 	.get_drvinfo = ch390_get_drvinfo,
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 6, 0))
 	.get_link_ksettings = phy_ethtool_get_link_ksettings,
 	.set_link_ksettings = phy_ethtool_set_link_ksettings,
+#else
+	.get_settings = ch390_get_settings,
+	.set_settings = ch390_set_settings,
+#endif
 	.get_msglevel = ch390_get_msglevel,
 	.set_msglevel = ch390_set_msglevel,
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0))
 	.nway_reset = phy_ethtool_nway_reset,
+#else
+	.nway_reset = ch390_nway_reset,
+#endif
 	.get_link = ethtool_op_get_link,
 	.get_eeprom_len = ch390_get_eeprom_len,
 	.get_eeprom = ch390_get_eeprom,
@@ -780,6 +843,7 @@ static int ch390_all_start(struct board_info *db)
 		return ret;
 
 	msleep(1);
+
 	return ch390_enable_interrupt(db);
 }
 
@@ -816,8 +880,9 @@ static int ch390_all_restart(struct board_info *db)
 	ret = ch390_set_reg(db, CH390_GPR, 0);
 	if (ret)
 		return ret;
-	
+
 	msleep(1);
+
 	ret = ch390_enable_interrupt(db);
 	if (ret)
 		return ret;
@@ -842,13 +907,13 @@ static int ch390_all_restart(struct board_info *db)
 static int ch390_loop_rx(struct board_info *db)
 {
 	struct net_device *ndev = db->ndev;
-	unsigned int rxbyte;
+	u8 rxbyte;
 	int ret, rxlen;
 	struct sk_buff *skb;
 	u8 *rdptr;
 	int scanrr = 0;
 
-	do {		
+	do {
 		ret = ch390_get_reg(db, OPC_MEM_DMY_R, &rxbyte);
 		if (ret)
 			return ret;
@@ -856,7 +921,28 @@ static int ch390_loop_rx(struct board_info *db)
 		ret = ch390_get_reg(db, OPC_MEM_DMY_R, &rxbyte);
 		if (ret)
 			return ret;
-		
+
+		if (rxbyte & CH390_PKT_ERR) {
+			ret = ch390_set_reg(db, CH390_RCR, 0);
+			if (ret)
+				return ret;
+
+			ret = ch390_set_reg(db, CH390_MPTRCR, 0x01);
+			if (ret)
+				return ret;
+
+			ret = ch390_set_reg(db, CH390_MRRH, 0x0c);
+			if (ret)
+				return ret;
+
+			msleep(1);
+			ret = ch390_set_reg(db, CH390_RCR, RCR_RXEN);
+			if (ret)
+				return ret;
+
+			break; /* packet-erro */
+		}
+
 		if (rxbyte != CH390_PKT_RDY)
 			break; /* exhaust-empty */
 
@@ -866,18 +952,16 @@ static int ch390_loop_rx(struct board_info *db)
 
 		rxlen = le16_to_cpu(db->rxhdr.rxlen);
 		if (db->rxhdr.status & RSR_ERR_BITS || rxlen > CH390_PKT_MAX) {
-			netdev_dbg(ndev, "rxhdr-byte (%02x)\n",
-				   db->rxhdr.headbyte);
+			netdev_dbg(ndev, "rxhdr-byte (%02x)\n", db->rxhdr.headbyte);
 
 			if (db->rxhdr.status & RSR_ERR_BITS) {
 				db->bc.status_err_counter++;
-				netdev_dbg(ndev, "check rxstatus-error (%02x)\n",
-					   db->rxhdr.status);
+				netdev_dbg(ndev, "check rxstatus-error (%02x)\n", db->rxhdr.status);
 			} else {
 				db->bc.large_err_counter++;
-				netdev_dbg(ndev, "check rxlen large-error (%d > %d)\n",
-					   rxlen, CH390_PKT_MAX);
+				netdev_dbg(ndev, "check rxlen large-error (%d > %d)\n", rxlen, CH390_PKT_MAX);
 			}
+
 			return ch390_all_restart(db);
 		}
 
@@ -936,7 +1020,7 @@ static int ch390_single_tx(struct board_info *db, u8 *buff, unsigned int len)
 	ret = ch390_set_reg(db, CH390_TXPLL, temp_low);
 	if (ret < 0)
 		return ret;
-	
+
 	ret = ch390_set_reg(db, CH390_TXPLH, temp_high);
 	if (ret < 0)
 		return ret;
@@ -1042,9 +1126,6 @@ static void ch390_rxctl_delay(struct work_struct *work)
 
 	ch390_set_recv(db);
 
-	/*
-	 * To has mutex unlock and return from this function if regmap function fail
-	 */
 out_unlock:
 	mutex_unlock(&db->spi_lockm);
 }
@@ -1221,13 +1302,18 @@ static void ch390_set_rx_mode(struct net_device *ndev)
 static int ch390_set_mac_address(struct net_device *ndev, void *p)
 {
 	struct board_info *db = to_ch390_board(ndev);
-	int ret;
+	struct sockaddr *addr = p;
 
-	ret = eth_prepare_mac_addr_change(ndev, p);
-	if (ret < 0)
-		return ret;
+	if (!(ndev->priv_flags & IFF_LIVE_ADDR_CHANGE) && netif_running(ndev))
+		return -EBUSY;
+	if (!is_valid_ether_addr(addr->sa_data))
+		return -EADDRNOTAVAIL;
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0))
 	eth_commit_mac_addr_change(ndev, p);
+#else
+	memcpy(ndev->dev_addr, addr->sa_data, ndev->addr_len);
+#endif
 	return ch390_set_regs(db, CH390_PAR, ndev->dev_addr, sizeof(ndev->dev_addr), TYPE_U8);
 }
 
@@ -1292,8 +1378,6 @@ static void ch390_handle_link_change(struct net_device *ndev)
 {
 	struct board_info *db = to_ch390_board(ndev);
 
-	phy_print_status(db->phydev);
-
 	/*
 	 * only write pause settings to mac. since mac and phy are integrated
 	 * together, such as link state, speed and duplex are sync already
@@ -1318,7 +1402,7 @@ static int ch390_phy_connect(struct board_info *db)
 
 	db->phydev = phy_connect(db->ndev, phy_id, ch390_handle_link_change, PHY_INTERFACE_MODE_MII);
 	if (IS_ERR(db->phydev))
-		return PTR_ERR_OR_ZERO(db->phydev);
+		return PTR_ERR(db->phydev);
 	return 0;
 }
 
@@ -1327,7 +1411,7 @@ static int ch390_probe(struct spi_device *spi)
 	struct device *dev = &spi->dev;
 	struct net_device *ndev;
 	struct board_info *db;
-	int ret;
+	int ret = 0;
 
 	ndev = alloc_etherdev(sizeof(*db));
 	if (!ndev)
@@ -1339,6 +1423,7 @@ static int ch390_probe(struct spi_device *spi)
 	db = netdev_priv(ndev);
 
 	db->msg_enable = 0;
+	db->reg_stride = 1;
 	db->spidev = spi;
 	db->ndev = ndev;
 
@@ -1350,10 +1435,6 @@ static int ch390_probe(struct spi_device *spi)
 
 	INIT_WORK(&db->rxctrl_work, ch390_rxctl_delay);
 	INIT_WORK(&db->tx_work, ch390_tx_delay);
-
-	ret = ch390_map_init(spi, db);
-	if (ret)
-		goto out1;
 
 	ret = ch390_map_chipid(db);
 	if (ret)
@@ -1378,12 +1459,12 @@ static int ch390_probe(struct spi_device *spi)
 	if (ret) {
 		phy_disconnect(db->phydev);
 		dev_err(dev, "device register failed: %d\n", ret);
-    	goto out2;
+		goto out2;
 	}
 
 	return 0;
 
-out2:	
+out2:
 	ch390_mdio_unregister(db);
 out1:
 	free_netdev(ndev);
@@ -1399,7 +1480,7 @@ static void ch390_drv_remove(struct spi_device *spi)
 	struct board_info *db = to_ch390_board(ndev);
 
 	phy_disconnect(db->phydev);
-	unregister_netdev (ndev);
+	unregister_netdev(ndev);
 	ch390_mdio_unregister(db);
 	free_netdev(ndev);
 }
@@ -1411,7 +1492,7 @@ static int ch390_drv_remove(struct spi_device *spi)
 	struct board_info *db = to_ch390_board(ndev);
 
 	phy_disconnect(db->phydev);
-	unregister_netdev (ndev);
+	unregister_netdev(ndev);
 	ch390_mdio_unregister(db);
 	free_netdev(ndev);
 
