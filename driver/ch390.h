@@ -4,12 +4,59 @@
 #include <linux/bits.h>
 #include <linux/netdevice.h>
 #include <linux/types.h>
+#include <linux/version.h>
+
+#define CH390_DEBUG 0
+#define CH390_DBG_FLOW "CH390_FLOW"
+#define CH390_DBG_REG "CH390_REG"
+#define CH390_DBG_RECOVERY "CH390_RECOVERY"
+
+#if CH390_DEBUG
+#define ch390_flow_dbg(_dev, _fmt, ...)                           \
+	netdev_info((_dev)->ndev, "%s %s: " _fmt, CH390_DBG_FLOW, \
+		    __func__, ##__VA_ARGS__)
+#define ch390_reg_dbg(_dev, _fmt, ...)                           \
+	netdev_info((_dev)->ndev, "%s %s: " _fmt, CH390_DBG_REG, \
+		    __func__, ##__VA_ARGS__)
+#define ch390_recovery_dbg(_dev, _fmt, ...)                           \
+	netdev_info((_dev)->ndev, "%s %s: " _fmt, CH390_DBG_RECOVERY, \
+		    __func__, ##__VA_ARGS__)
+#else
+#define ch390_flow_dbg(_dev, _fmt, ...) \
+	do {                            \
+	} while (0)
+#define ch390_reg_dbg(_dev, _fmt, ...) \
+	do {                           \
+	} while (0)
+#define ch390_recovery_dbg(_dev, _fmt, ...) \
+	do {                                \
+	} while (0)
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 19, 0)
+#ifndef READ_ONCE
+#define READ_ONCE(x) ACCESS_ONCE(x)
+#endif
+
+#ifndef WRITE_ONCE
+#define WRITE_ONCE(x, val)              \
+	do {                            \
+		ACCESS_ONCE(x) = (val); \
+	} while (0)
+#endif
+#endif
 
 #define CH390_ID 0x9151
 #define GPIO_NUMBER 0
 
 #define USE_IRQ_FROM_DTS
 //#undef USE_IRQ_FROM_DTS
+
+#define CH390_LINK_UP_INTVAL_MS 200
+#define CH390_LINK_UP_FAIL_COUNT 5
+#define CH390_LINK_UP_PASS_COUNT 2
+#define CH390_LINK_UP_SAMPLE_DELAY_US 1000
+#define CH390_LINK_DOWN_INTVAL_MS 500
 
 #define CH390_TX_OVERHEAD 1
 #define REG_LABEL(REG) { #REG, REG }
@@ -201,6 +248,28 @@ enum ch390_phy_mode {
 #define IMR_ROI (1 << 2) /* Enable receive overflow interrupt */
 #define IMR_PTI (1 << 1) /* Enable packet transmitted interrupt */
 #define IMR_PRI (1 << 0) /* Enable packet received interrupt */
+#define CH390_PHY_PAG_SEL 0x1F
+#define CH390_PHY_PAGE0 0x00
+#define CH390_PHY_PAGE7 0x07
+#define CH390_PHY_STATUS0 0x10
+#define CH390_LINK_LATCH_UP BIT(9)
+#define CH390_POLARITY_STATE BIT(12)
+#define CH390_INTERRUPT_MASK 0x13
+#define CH390_INT_LINKCHG BIT(13)
+#define CH390_PCSR_100M_CTL 0x16
+#define CH390_PHY_PWR_SAVE 0x18
+#define CH390_PWR_RST_OK BIT(1)
+#define CH390_PHY_ENPWR_SAVE (1 << 15)
+#define CH390_PHYPN_PULSE_CTL 0x19
+#define CH390_PHYPN_PULSE_FORCE_OK BIT(12)
+#define CH390_PHYPN_PULSE_STATUS0 0x1A
+#define CH390_PHYPN_PULSE_STATE BIT(4)
+#define CH390_PHYPN_LATCH_CTL 0x1B
+#define CH390_PHYPN_LATCH_FORCE_OK BIT(15)
+#define CH390_INTERRUPT_IND 0x1E
+#define CH390_PHY_PAGE99 0x63
+#define CH390_PHY_LINK_PULSE_STATUS 0x1B
+#define CH390_LINK_PULSE_UP BIT(2)
 
 /* SPI commands */
 #define OPC_REG_W 0x80 /* Register Write */
@@ -208,11 +277,6 @@ enum ch390_phy_mode {
 #define OPC_MEM_DMY_R 0x70 /* Memory Dummy Read */
 #define OPC_MEM_WRITE 0xF8 /* Memory Write */
 #define OPC_MEM_READ 0x72 /* Memory Read */
-
-/* GPIO */
-#define CH390_GPIO1 0x02
-#define CH390_GPIO2 0x04
-#define CH390_GPIO3 0x08
 
 /* PHY register */
 #define CH390_PHY_ADDR 1
@@ -238,7 +302,7 @@ enum ch390_phy_mode {
 
 #define CH390_RXHDR_SIZE sizeof(struct ch390_rxhdr)
 
-static inline struct board_info *to_ch390_board(struct net_device *ndev)
+static inline struct ch390_priv *to_ch390_priv(struct net_device *ndev)
 {
 	return netdev_priv(ndev);
 }

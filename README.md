@@ -1,51 +1,69 @@
-ch390 SPI Ethernet Driver
-===========================
-This driver can only work with SPI Ethernet function in these WCH devices:
-CH390H, CH390D
+# ch390 SPI 以太网驱动
 
-Integrated into your system method1
----------------------------------------
-If you are using dts device tree to set up spi and driver, you can read this method, otherwise
-please refer to method2.
+该驱动仅适用于以下 WCH 设备中的 SPI 以太网功能：
 
-1. Please copy the driver file to the package directory which be used to add additional drivers.
+- CH390H
+- CH390D
 
-2. Please add the relevant Makefile and Kconfig like other drivers, generally you can copy one
-from other driver then modify it.
+## 集成到系统的方法 1
 
-3. Run the make menuconfig and select the ch390 ethernet support at "modules" item.
+如果你使用 dts 设备树来配置 SPI 和驱动，可以参考此方法；否则请参考方法 2。
 
-4. Define the spi structure on your dts file similar the follow: 
-	spidev@1 {
-		#address-cells = <1>;
-		#size-cells = <1>;
-		compatible = "ch390_ethernet";
-		reg = <1 0>;
-		spi-max-frequency = <5000000>;
-		interrupt-parent = <&gpio0>;
-		interrupts = <0 2>;
-	}
-	Notice that the irq request method cannot be supported in this way in some platforms.
-	You should modify it in ch390.c in method ch390_open.
+1. 请将驱动文件复制到用于添加额外驱动的软件包目录中。
 
-Integrated into your system method2
----------------------------------------
-1. Please copy the driver file to the kernel directory:$kernel_src/drivers/net/ethernet
+2. 请像其他驱动一样添加相应的 `Makefile` 和 `Kconfig`。通常可以从其他驱动复制一份，然后再进行修改。
 
-2. Please add the followed txt into the kernel file:$kernel_src/drivers/net/ethernet/Kconfig
+3. 运行 `make menuconfig`，并在 `"modules"` 项中选择 `ch390 ethernet support`。
+
+4. 在你的 dts 文件中定义类似如下的 SPI 结构：
+
+```dts
+#include <dt-bindings/interrupt-controller/irq.h>
+
+spidev@1 {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	compatible = "ch390_ethernet";
+	reg = <1 0>;
+	spi-max-frequency = <5000000>;
+	interrupt-parent = <&gpio0>;
+	interrupts = <0 IRQ_TYPE_LEVEL_LOW>;
+}
+```
+
+`interrupts` 的触发类型需要根据硬件连接配置为电平触发。驱动支持通过设备树设置为低电平有效或高电平有效：
+
+```dts
+interrupts = <0 IRQ_TYPE_LEVEL_LOW>;
+interrupts = <0 IRQ_TYPE_LEVEL_HIGH>;
+```
+
+## 集成到系统的方法 2
+
+1. 请将驱动文件复制到内核目录：`$kernel_src/drivers/net/ethernet`
+
+2. 请将以下文本添加到内核文件：`$kernel_src/drivers/net/ethernet/Kconfig`
+
+```text
 config ETHERNET_CH390
 	tristate "ETHERNET_CH390 ethernet support"
 	depends on SPI
 	select SERIAL_CORE
 	help
 	  This selects support for ch390 ethernet.
-	
-3. Add the follow define into the $kernel_src/drivers/net/ethernet/Makefile for compile the driver.
+```
+
+3. 将以下定义添加到 `$kernel_src/drivers/net/ethernet/Makefile`，用于编译该驱动。
+
+```makefile
 obj-$(CONFIG_SERIAL_CH390) += ch390.o
+```
 
-4. Run the make menuconfig and select the ch390 ethernet support at the driver/net/ethernet and save the config.
+4. 运行 `make menuconfig`，并在 `driver/net/ethernet` 中选择 `ch390 ethernet support`，然后保存配置。
 
-5. Define the spi0_board_info object on your board file similar the follow:
+5. 在你的板级文件中定义类似如下的 `spi0_board_info` 对象：
+
+```c
 static struct spi_board_info spi0_board_info[] __initdata = {
 	{
 		.modalias = "ch390_ethernet",
@@ -58,7 +76,8 @@ static struct spi_board_info spi0_board_info[] __initdata = {
 		.irq = IRQ_EINT(25),
 	}
 };
+```
 
-**Note**
+## 注意
 
-Any question, you can send feedback to mail: tech@wch.cn
+如有任何问题，可以发送反馈邮件至：tech@wch.cn
